@@ -4,7 +4,7 @@ import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 import { ZodError } from 'zod';
 import { env } from '../lib/env.js';
 import { AppError, isAppError } from '../lib/errors.js';
-import { logger, logToolCall } from '../lib/logger.js';
+import { getLoggerConfig, logger, logToolCall } from '../lib/logger.js';
 import { buildContext, type AppContext } from './context.js';
 import { registerAdminRoutes } from './routes/admin.js';
 import { registerPublicRoutes } from './routes/public.js';
@@ -34,7 +34,7 @@ export interface BuildAppOptions {
 export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyInstance> {
   const config = env();
   const app = Fastify({
-    logger: logger(),
+    logger: getLoggerConfig(),
     // The voice platform sends a request id; reusing it means one identifier
     // spans the call transcript, our logs and their dashboard.
     genReqId: (req) => (req.headers['x-request-id'] as string) ?? crypto.randomUUID(),
