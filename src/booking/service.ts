@@ -71,7 +71,9 @@ export interface CreateBookingInput {
 
 export interface ModifyBookingInput {
   restaurantId: string;
-  reservationId: string;
+  /** One of these is required; phone resolves to the next upcoming booking. */
+  reservationId?: string;
+  phone?: string;
   date?: LocalDate;
   time?: LocalTime;
   partySize?: number;
@@ -277,9 +279,26 @@ export class BookingService {
       if (existing) return this.replay(existing);
     }
 
+    if (!input.reservationId && !input.phone) {
+      throw badRequest('Provide a reservation id or a phone number');
+    }
+
     const current = await db.reservation.findFirst({
-      where: { id: input.reservationId, restaurantId: input.restaurantId },
+      where: {
+        restaurantId: input.restaurantId,
+        ...(input.reservationId
+          ? { id: input.reservationId }
+          : {
+              // A caller does not know their reservation id. Resolve the
+              // number they are ringing from to their next live booking, which
+              // is what "move my table" means on the phone.
+              guest: { phone: input.phone, restaurantId: input.restaurantId },
+              status: { in: ['held', 'confirmed'] },
+              startsAt: { gte: this.now() },
+            }),
+      },
       include: { tables: { select: { tableId: true } }, guest: true },
+      orderBy: { startsAt: 'asc' },
     });
     if (!current)
       throw notFound(

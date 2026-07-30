@@ -259,6 +259,7 @@ export async function registerVoiceRoutes(app: FastifyInstance): Promise<void> {
     const result = await ctx.bookings.modify({
       restaurantId,
       reservationId: body.reservation_id,
+      phone: body.phone,
       date: body.date,
       time: body.time,
       partySize: body.party_size,

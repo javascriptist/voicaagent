@@ -191,13 +191,21 @@ export const LookupBookingResponse = z.object({
 
 export const ModifyBookingRequest = z.object({
   call_id: z.string().min(1).max(128),
-  reservation_id: z.uuid(),
+  /**
+   * Either identifier works. A caller on the phone does not know their
+   * reservation id, and a voice flow with no lookup step has only the number
+   * they are ringing from, so `phone` resolves to their next upcoming booking.
+   */
+  reservation_id: z.uuid().optional(),
+  phone: PhoneSchema.optional(),
   date: LocalDateSchema.optional(),
   time: LocalTimeSchema.optional(),
   party_size: PartySizeSchema.optional(),
   accessibility: z.array(z.enum(ACCESSIBILITY_REQUIREMENTS)).max(7).optional(),
   seating_preferences: z.array(z.enum(SEATING_PREFERENCES)).max(8).optional(),
   notes: z.string().max(2000).optional(),
+}).refine((v) => Boolean(v.reservation_id ?? v.phone), {
+  message: 'Provide reservation_id or phone',
 });
 
 export const CancelBookingRequest = z.object({
