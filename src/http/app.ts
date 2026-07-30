@@ -8,6 +8,7 @@ import { getLoggerConfig, logger, logToolCall } from '../lib/logger.js';
 import { buildContext, type AppContext } from './context.js';
 import { registerAdminRoutes } from './routes/admin.js';
 import { registerPublicRoutes } from './routes/public.js';
+import { registerVapiRoutes } from './routes/vapi.js';
 import { registerVoiceRoutes } from './routes/voice.js';
 
 declare module 'fastify' {
@@ -156,6 +157,8 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   await app.register(registerVoiceRoutes, { prefix: '/v1/voice' });
   await app.register(registerAdminRoutes, { prefix: '/v1/admin' });
   await app.register(registerPublicRoutes, { prefix: '/v1/public' });
+  // Vapi speaks a different envelope; same engine underneath.
+  await app.register(registerVapiRoutes, { prefix: '/v1/vapi' });
 
   return app;
 }
