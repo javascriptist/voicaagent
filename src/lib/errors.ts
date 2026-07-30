@@ -45,7 +45,11 @@ const DEFAULT_SPEECH: Record<ErrorCode, string> = {
   bad_request: "Sorry, I didn't quite catch that. Could you say it again?",
   unauthorized: 'Sorry, I am not able to do that right now.',
   forbidden: 'Sorry, I am not able to do that right now.',
-  not_found: "Sorry, I can't find a booking with those details. Could you check the phone number?",
+  // Deliberately neutral. `not_found` covers a missing restaurant, a missing
+  // knowledge document and an unrouted URL as well as a missing booking, and
+  // the booking-specific wording was being read aloud for all of them. Call
+  // sites that really are about a booking pass their own hint.
+  not_found: "Sorry, I can't find that. Let me put you through to the team.",
   conflict: 'Sorry, something changed while I was booking that. Let me try again.',
   slot_taken: 'Sorry, that table has just gone. Let me find you another time.',
   hold_expired: 'Sorry, that table was only held for a few minutes and it has gone. Let me check again.',

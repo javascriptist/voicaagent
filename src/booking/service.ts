@@ -281,7 +281,11 @@ export class BookingService {
       where: { id: input.reservationId, restaurantId: input.restaurantId },
       include: { tables: { select: { tableId: true } }, guest: true },
     });
-    if (!current) throw notFound('Reservation not found');
+    if (!current)
+      throw notFound(
+        'Reservation not found',
+        "Sorry, I can't find a booking with those details. Could you check the phone number?",
+      );
     if (current.status === 'cancelled') {
       throw badRequest(
         'Reservation is already cancelled',
@@ -410,7 +414,11 @@ export class BookingService {
       orderBy: { startsAt: 'asc' },
     });
 
-    if (!target) throw notFound('No upcoming booking found to cancel');
+    if (!target)
+      throw notFound(
+        'No upcoming booking found to cancel',
+        "Sorry, I can't find a booking to cancel under that number. Could you check it?",
+      );
 
     // Cancelling twice is a success, not a conflict: the agent may retry, and
     // the guest's intent is already satisfied.
@@ -455,7 +463,11 @@ export class BookingService {
       where: { id: reservationId, restaurantId },
       select: { id: true },
     });
-    if (!existing) throw notFound('Reservation not found');
+    if (!existing)
+      throw notFound(
+        'Reservation not found',
+        "Sorry, I can't find a booking with those details. Could you check the phone number?",
+      );
 
     const updated = await this.deps.db.reservation.update({
       where: { id: reservationId },
