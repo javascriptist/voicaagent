@@ -1,0 +1,478 @@
+// Voice AI restaurant reservation platform.
+//
+// Two things in here are load-bearing and cannot be expressed in Prisma schema
+// language, so they live in prisma/migrations/*/migration.sql instead:
+//
+//   1. The exclusion constraint on reservation_tables that makes double booking
+//      physically impossible. See `reservation_tables` below.
+//   2. The HNSW index on knowledge_chunks.embedding (pgvector).
+//
+// Everything stored as timestamptz, always UTC. Conversion to and from the
+// restaurant's IANA timezone happens at the edge, in src/time/.
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [vector, btree_gist, pgcrypto]
+}
+
+// ---------------------------------------------------------------------------
+// Tenancy
+// ---------------------------------------------------------------------------
+
+model Restaurant {
+  id                   String   @id @default(uuid()) @db.Uuid
+  name                 String
+  slug                 String   @unique
+  /// IANA identifier, e.g. "Europe/London". Validated against Intl on write.
+  timezone             String
+  phone                String
+  largePartyThreshold  Int      @default(8) @map("large_party_threshold")
+  /// Turn times in minutes keyed by party size, with a "default" fallback:
+  /// { "default": 90, "1": 60, "2": 90, "6": 120 }
+  /// Lookup walks down from the exact party size, see src/availability/turnTime.ts
+  defaultTurnTimes     Json     @map("default_turn_times")
+  bookingWindowDays    Int      @default(90) @map("booking_window_days")
+  cancellationPolicy   String   @default("") @map("cancellation_policy")
+  /// Shared secret for verifying HMAC signatures on /v1/voice webhooks.
+  hmacSecret           String   @map("hmac_secret")
+  flexibilityMinutes   Int      @default(60) @map("flexibility_minutes")
+  createdAt            DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt            DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  floors             Floor[]
+  tables             Table[]
+  servicePeriods     ServicePeriod[]
+  closures           Closure[]
+  tableBlocks        TableBlock[]
+  guests             Guest[]
+  reservations       Reservation[]
+  reservationTables  ReservationTable[]
+  waitlist           WaitlistEntry[]
+  enquiries          Enquiry[]
+  callLogs           CallLog[]
+  knowledgeDocuments KnowledgeDocument[]
+  knowledgeChunks    KnowledgeChunk[]
+  adminUsers         AdminUser[]
+
+  @@map("restaurants")
+}
+
+model AdminUser {
+  id           String   @id @default(uuid()) @db.Uuid
+  restaurantId String   @map("restaurant_id") @db.Uuid
+  email        String
+  passwordHash String   @map("password_hash")
+  role         String   @default("owner")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  restaurant Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+
+  @@unique([restaurantId, email])
+  @@index([restaurantId])
+  @@map("admin_users")
+}
+
+// ---------------------------------------------------------------------------
+// Floor plan
+// ---------------------------------------------------------------------------
+
+model Floor {
+  id            String  @id @default(uuid()) @db.Uuid
+  restaurantId  String  @map("restaurant_id") @db.Uuid
+  name          String
+  /// 0 is ground. Negative is basement.
+  level         Int
+  stepFreeAccess Boolean @default(false) @map("step_free_access")
+
+  restaurant Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+  tables     Table[]
+
+  @@unique([restaurantId, name])
+  @@index([restaurantId])
+  @@map("floors")
+}
+
+enum TableShape {
+  round
+  square
+  rectangle
+  oval
+
+  @@map("table_shape")
+}
+
+model Table {
+  id           String     @id @default(uuid()) @db.Uuid
+  restaurantId String     @map("restaurant_id") @db.Uuid
+  floorId      String     @map("floor_id") @db.Uuid
+  label        String
+  minCovers    Int        @map("min_covers")
+  maxCovers    Int        @map("max_covers")
+  shape        TableShape @default(rectangle)
+
+  // Layout editor geometry, in the editor's own coordinate space.
+  x      Float
+  y      Float
+  width  Float
+  height Float
+
+  /// Typed by TableAttributesSchema in src/domain/attributes.ts. Shape:
+  ///   zone: main | terrace | bar | private | mezzanine
+  ///   seat_type: chair | banquette | booth | high_stool
+  ///   is_wheelchair_accessible, has_wheelchair_clearance: bool
+  ///   near_window, near_entrance, near_toilets, near_kitchen, near_speakers: bool
+  ///   noise_level: quiet | normal | loud
+  ///   is_combinable: bool, combines_with: table id array
+  attributes Json
+
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  restaurant        Restaurant         @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+  floor             Floor              @relation(fields: [floorId], references: [id], onDelete: Cascade)
+  blocks            TableBlock[]
+  reservationTables ReservationTable[]
+
+  @@unique([restaurantId, label])
+  @@index([restaurantId])
+  @@index([floorId])
+  @@map("tables")
+}
+
+// ---------------------------------------------------------------------------
+// When the restaurant is open
+// ---------------------------------------------------------------------------
+
+model ServicePeriod {
+  id           String @id @default(uuid()) @db.Uuid
+  restaurantId String @map("restaurant_id") @db.Uuid
+  name         String
+  /// ISO-8601 weekdays in the restaurant's local timezone: 1 = Monday .. 7 = Sunday.
+  daysOfWeek   Int[]  @map("days_of_week")
+  /// Local wall-clock "HH:mm". Never a timestamp: 18:00 dinner stays 18:00 across DST.
+  startTime    String @map("start_time") @db.VarChar(5)
+  endTime      String @map("end_time") @db.VarChar(5)
+  slotIntervalMinutes Int @default(15) @map("slot_interval_minutes")
+  /// Last bookable slot is endTime + this offset. Negative pulls it earlier,
+  /// e.g. -60 means the last seating is an hour before close.
+  lastSeatingOffsetMinutes Int @default(-60) @map("last_seating_offset_minutes")
+  /// Optional per-period override of the restaurant's default_turn_times,
+  /// same shape. Null means inherit.
+  turnTimeOverrides Json? @map("turn_time_overrides")
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  restaurant Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+
+  @@index([restaurantId])
+  @@map("service_periods")
+}
+
+model Closure {
+  id           String   @id @default(uuid()) @db.Uuid
+  restaurantId String   @map("restaurant_id") @db.Uuid
+  startsAt     DateTime @map("starts_at") @db.Timestamptz(6)
+  endsAt       DateTime @map("ends_at") @db.Timestamptz(6)
+  reason       String
+
+  restaurant Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+
+  @@index([restaurantId, startsAt, endsAt])
+  @@map("closures")
+}
+
+model TableBlock {
+  id           String   @id @default(uuid()) @db.Uuid
+  restaurantId String   @map("restaurant_id") @db.Uuid
+  tableId      String   @map("table_id") @db.Uuid
+  startsAt     DateTime @map("starts_at") @db.Timestamptz(6)
+  endsAt       DateTime @map("ends_at") @db.Timestamptz(6)
+  reason       String
+
+  restaurant Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+  table      Table      @relation(fields: [tableId], references: [id], onDelete: Cascade)
+
+  @@index([restaurantId, startsAt, endsAt])
+  @@index([tableId, startsAt, endsAt])
+  @@map("table_blocks")
+}
+
+// ---------------------------------------------------------------------------
+// Guests and reservations
+// ---------------------------------------------------------------------------
+
+model Guest {
+  id           String @id @default(uuid()) @db.Uuid
+  restaurantId String @map("restaurant_id") @db.Uuid
+  /// E.164. Unique per restaurant, not globally: the same person calling two
+  /// restaurants is two guest records, and neither tenant learns about the other.
+  phone        String
+  name         String
+  notes        String @default("")
+  /// Accessibility needs that apply to every visit, so the agent does not have
+  /// to ask again. Same vocabulary as reservation.accessibility.
+  standingAccessibilityNeeds Json @default("[]") @map("standing_accessibility_needs")
+  visitCount   Int      @default(0) @map("visit_count")
+  noShowCount  Int      @default(0) @map("no_show_count")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  restaurant   Restaurant      @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+  reservations Reservation[]
+  waitlist     WaitlistEntry[]
+
+  @@unique([restaurantId, phone])
+  @@index([restaurantId])
+  @@map("guests")
+}
+
+enum ReservationStatus {
+  held
+  confirmed
+  seated
+  completed
+  cancelled
+  no_show
+
+  @@map("reservation_status")
+}
+
+enum ReservationSource {
+  voice
+  web
+  walk_in
+
+  @@map("reservation_source")
+}
+
+model Reservation {
+  id           String            @id @default(uuid()) @db.Uuid
+  restaurantId String            @map("restaurant_id") @db.Uuid
+  guestId      String            @map("guest_id") @db.Uuid
+  /// Denormalised copy for cheap reads. The authoritative per-table rows, and
+  /// the ones the exclusion constraint sees, are in reservation_tables.
+  tableIds     String[]          @map("table_ids") @db.Uuid
+  startsAt     DateTime          @map("starts_at") @db.Timestamptz(6)
+  /// startsAt + turn time. Stored rather than derived so the exclusion
+  /// constraint has something to range over.
+  endsAt       DateTime          @map("ends_at") @db.Timestamptz(6)
+  partySize    Int               @map("party_size")
+  status       ReservationStatus @default(held)
+  source       ReservationSource
+
+  /// Array of accessibility requirement keys, see src/domain/accessibility.ts.
+  accessibility       Json    @default("[]")
+  /// Array of seating preference keys, see src/domain/preferences.ts.
+  seatingPreferences  Json    @default("[]") @map("seating_preferences")
+  /// Stored exactly as the guest said it, never normalised or summarised.
+  /// Allergy information is safety critical; paraphrasing it is a hazard.
+  allergiesVerbatim   String? @map("allergies_verbatim")
+  occasion            String?
+  notes               String  @default("")
+
+  /// Unique per restaurant. Replaying a write with the same key returns the
+  /// original reservation instead of creating a second one.
+  idempotencyKey String?  @map("idempotency_key")
+  callId         String?  @map("call_id")
+  cancelledAt    DateTime? @map("cancelled_at") @db.Timestamptz(6)
+  cancellationReason String? @map("cancellation_reason")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  restaurant Restaurant         @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+  guest      Guest              @relation(fields: [guestId], references: [id], onDelete: Restrict)
+  tables     ReservationTable[]
+
+  @@unique([restaurantId, idempotencyKey], name: "reservation_idempotency")
+  @@index([restaurantId, startsAt])
+  @@index([restaurantId, status, startsAt])
+  @@index([guestId])
+  @@map("reservations")
+}
+
+/// One row per (reservation, table). This exists so Postgres can enforce
+/// "no two live reservations overlap on the same table" with an exclusion
+/// constraint, which an array column on reservations cannot do.
+///
+/// startsAt/endsAt/status are mirrored from the parent reservation and kept in
+/// sync by a trigger (see migration.sql) so no application path can drift them.
+model ReservationTable {
+  id            String            @id @default(uuid()) @db.Uuid
+  restaurantId  String            @map("restaurant_id") @db.Uuid
+  reservationId String            @map("reservation_id") @db.Uuid
+  tableId       String            @map("table_id") @db.Uuid
+  startsAt      DateTime          @map("starts_at") @db.Timestamptz(6)
+  endsAt        DateTime          @map("ends_at") @db.Timestamptz(6)
+  status        ReservationStatus
+
+  restaurant  Restaurant  @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+  reservation Reservation @relation(fields: [reservationId], references: [id], onDelete: Cascade)
+  table       Table       @relation(fields: [tableId], references: [id], onDelete: Cascade)
+
+  @@unique([reservationId, tableId])
+  @@index([tableId, startsAt, endsAt])
+  @@index([restaurantId, startsAt])
+  @@map("reservation_tables")
+}
+
+// ---------------------------------------------------------------------------
+// Waitlist, enquiries, calls
+// ---------------------------------------------------------------------------
+
+enum WaitlistStatus {
+  waiting
+  offered
+  converted
+  expired
+  cancelled
+
+  @@map("waitlist_status")
+}
+
+model WaitlistEntry {
+  id           String         @id @default(uuid()) @db.Uuid
+  restaurantId String         @map("restaurant_id") @db.Uuid
+  guestId      String         @map("guest_id") @db.Uuid
+  /// Local calendar date in the restaurant's timezone, "YYYY-MM-DD".
+  date         String         @db.VarChar(10)
+  windowStart  DateTime       @map("window_start") @db.Timestamptz(6)
+  windowEnd    DateTime       @map("window_end") @db.Timestamptz(6)
+  partySize    Int            @map("party_size")
+  status       WaitlistStatus @default(waiting)
+  accessibility      Json    @default("[]")
+  seatingPreferences Json    @default("[]") @map("seating_preferences")
+  idempotencyKey String?  @map("idempotency_key")
+  callId         String?  @map("call_id")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  restaurant Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+  guest      Guest      @relation(fields: [guestId], references: [id], onDelete: Cascade)
+
+  @@unique([restaurantId, idempotencyKey], name: "waitlist_idempotency")
+  @@index([restaurantId, date, status])
+  @@map("waitlist")
+}
+
+enum EnquiryStatus {
+  open
+  in_progress
+  closed
+
+  @@map("enquiry_status")
+}
+
+model Enquiry {
+  id           String        @id @default(uuid()) @db.Uuid
+  restaurantId String        @map("restaurant_id") @db.Uuid
+  /// e.g. private_hire, lost_property, feedback, press, supplier, other
+  category     String
+  guestName    String        @map("guest_name")
+  phone        String
+  message      String
+  status       EnquiryStatus @default(open)
+  idempotencyKey String?  @map("idempotency_key")
+  callId         String?  @map("call_id")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  restaurant Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+
+  @@unique([restaurantId, idempotencyKey], name: "enquiry_idempotency")
+  @@index([restaurantId, status, createdAt])
+  @@map("enquiries")
+}
+
+model CallLog {
+  id           String    @id @default(uuid()) @db.Uuid
+  restaurantId String    @map("restaurant_id") @db.Uuid
+  callId       String    @map("call_id")
+  callerNumber String?   @map("caller_number")
+  startedAt    DateTime? @map("started_at") @db.Timestamptz(6)
+  endedAt      DateTime? @map("ended_at") @db.Timestamptz(6)
+  transcript   Json      @default("[]")
+  outcome      String?
+  /// Append-only array of { tool, at, latency_ms, ok, code }.
+  toolCalls    Json      @default("[]") @map("tool_calls")
+  recordingUrl String?   @map("recording_url")
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  restaurant Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+
+  @@unique([restaurantId, callId])
+  @@index([restaurantId, startedAt])
+  @@map("call_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Knowledge
+// ---------------------------------------------------------------------------
+
+enum KnowledgeSource {
+  policy
+  menu
+  faq
+  layout
+  hours
+
+  @@map("knowledge_source")
+}
+
+model KnowledgeDocument {
+  id           String          @id @default(uuid()) @db.Uuid
+  restaurantId String          @map("restaurant_id") @db.Uuid
+  source       KnowledgeSource
+  title        String
+  content      String
+  /// True for chunks this system wrote from structured data (hours,
+  /// accessibility, zones). Admin edits to these are overwritten on the next
+  /// structural change, so the admin API refuses to update them.
+  isGenerated  Boolean         @default(false) @map("is_generated")
+  /// Stable key for regenerating a generated document in place, e.g.
+  /// "generated:hours" or "generated:accessibility".
+  generationKey String?        @map("generation_key")
+  /// pending | processing | ready | failed — drives the re-embedding job.
+  embedStatus  String          @default("pending") @map("embed_status")
+  embedError   String?         @map("embed_error")
+  createdAt    DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime        @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  restaurant Restaurant       @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+  chunks     KnowledgeChunk[]
+
+  @@unique([restaurantId, generationKey], name: "knowledge_generation_key")
+  @@index([restaurantId, source])
+  @@map("knowledge_documents")
+}
+
+model KnowledgeChunk {
+  id           String          @id @default(uuid()) @db.Uuid
+  restaurantId String          @map("restaurant_id") @db.Uuid
+  documentId   String?         @map("document_id") @db.Uuid
+  source       KnowledgeSource
+  title        String
+  content      String
+  /// voyage-3, 1024 dims, cosine. Prisma has no vector type, so this is
+  /// Unsupported and every read/write of it goes through raw SQL in
+  /// src/knowledge/store.ts.
+  embedding    Unsupported("vector(1024)")?
+  tokenCount   Int             @map("token_count")
+  chunkIndex   Int             @default(0) @map("chunk_index")
+  createdAt    DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  restaurant Restaurant         @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+  document   KnowledgeDocument? @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@index([restaurantId])
+  @@index([documentId])
+  @@map("knowledge_chunks")
+}
