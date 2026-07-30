@@ -12,8 +12,8 @@ import { env } from './env.js';
 
 let instance: Logger | null = null;
 
-export function logger(): Logger {
-  instance ??= pino({
+export function getLoggerConfig() {
+  return {
     level: env().LOG_LEVEL,
     redact: {
       // Secrets and caller PII must not reach the log store. Phone numbers are
@@ -33,9 +33,13 @@ export function logger(): Logger {
     base: { service: 'aicallcenter' },
     timestamp: pino.stdTimeFunctions.isoTime,
     formatters: {
-      level: (label) => ({ level: label }),
+      level: (label: string) => ({ level: label }),
     },
-  });
+  };
+}
+
+export function logger(): Logger {
+  instance ??= pino(getLoggerConfig());
   return instance;
 }
 
